@@ -1,6 +1,8 @@
 (ns mesos-example.core
   (:use [mesos-example.proto])
-  (:require [clojure.pprint :as pp])
+  (:require
+   [clojure.pprint :as pp]
+   [taoensso.nippy :as nippy])
   (:import
    [org.apache.mesos Scheduler MesosSchedulerDriver Executor MesosExecutorDriver]
    org.apache.mesos.Protos)
@@ -20,6 +22,11 @@
   (let [driver (:driver state)]
     (doseq [[key offer] (:offers state)]
       (.declineOffer driver (.getId offer)))))
+
+
+;;; Messages
+
+
 
 
 ;;; Scheduler
@@ -51,7 +58,7 @@
       ;; Invoked when an executor sends a message.
       (frameworkMessage
         [this driver executor-id slave-id data]
-        (println ::framework-message driver executor-id slave-id data))
+        (println ::scheduler-received-message driver executor-id slave-id (nippy/thaw data)))
 
       ;; Invoked when an offer is no longer valid (e.g., the slave was
       ;; lost or another framework used resources in the offer).
@@ -74,7 +81,7 @@
       ;; Invoked when resources have been offered to this framework.
       (resourceOffers
         [this driver offers]
-        (println ::offers driver offers)
+        (println ::offers driver (count offers))
 
         (doseq [offer offers]
           (let [{cpus :cpus mem :mem} (offer-resources offer)]
@@ -100,6 +107,12 @@
       (statusUpdate
         [this driver status]
         (println ::status-update driver status)
+        (if (= (.getState status) RUNNING)
+          (.sendFrameworkMessage
+           driver
+           (.getExecutorId executor)
+           (.getSlaveId status)
+           (nippy/freeze {:method :ping})))
         (if (= (.getState status) FINISHED)
           (.stop driver))))))
 
@@ -121,20 +134,16 @@
     (assert (not-empty master))
     (assert (not-empty principal))
 
-    (swap! state-atom
-           assoc :driver
-           (MesosSchedulerDriver.
-            (reify-scheduler state-atom executor)
-            (describe-framework principal (or name principal))
-            master))
-
-    state-atom))
+    (MesosSchedulerDriver.
+     (reify-scheduler state-atom executor)
+     (describe-framework principal (or name principal))
+     master)))
 
 (defn- start-scheduler
   []
   (let [driver
         (scheduler
-         :master "127.0.0.1:5050"
+         :master "127.0.1.1:5050"
          :principal "example-clojure-framework"
          :executor
          (ExecutorInfo
@@ -149,7 +158,7 @@
           :name "Mesos Shell Executor"
           :source "mesos-example"))]
 
-    (.start (:driver @driver))
+    (.start driver)
     driver))
 
 
@@ -176,7 +185,8 @@
     ;; Invoked when a framework message has arrived for this executor.
     (frameworkMessage
       [this driver data]
-      (println ::framework-message driver data))
+      (println ::executor-received-message driver (nippy/thaw data))
+      (.sendFrameworkMessage driver (nippy/freeze {:method :pong})))
 
     ;; Invoked when a task running within this executor has been
     ;; killed (via SchedulerDriver.killTask(TaskID)).
@@ -229,10 +239,11 @@
 (defn- start-executor
   []
   (let [driver (MesosExecutorDriver. (reify-executor))]
-    (.run driver)))
+    (.start driver)
+    driver))
 
 (defn -main
   [mode & args]
   (case mode
-    "cluster" (apply start-scheduler args)
-    "fork!" (apply start-executor args)))
+    "cluster" (.join (apply start-scheduler args))
+    "fork!" (.join (apply start-executor args))))
